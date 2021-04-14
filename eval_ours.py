@@ -1,0 +1,126 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Apr 13 09:22:15 2021
+
+@author: coltonwu
+"""
+
+import argparse
+import os, sys
+
+parser = argparse.ArgumentParser(description="Arg parser")
+parser.add_argument('--gpu', type=int, default=0, help='GPU to use')
+parser.add_argument("--model", type=str, default='punet1')
+parser.add_argument("--batch_size", type=int, default=8)
+parser.add_argument("--workers", type=int, default=4)
+parser.add_argument('--up_ratio',  type=int,  default=4, help='Upsampling Ratio [default: 4]')
+parser.add_argument("--use_bn", action='store_true', default=False)
+parser.add_argument("--use_res", action='store_true', default=False)
+parser.add_argument('--resume', type=str, required=True)
+
+args = parser.parse_args()
+print(args)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import numpy as np
+
+from dataset import PUNET_Dataset_WholeFPS_1k, PUNET_Dataset
+from chamfer_distance import chamfer_distance
+from auction_match import auction_match
+from pointnet2 import pointnet2_utils as pn2_utils
+import importlib
+
+def get_emd_loss(pred, gt, pcd_radius):
+    idx, _ = auction_match(pred, gt)
+    matched_out = pn2_utils.gather_operation(gt.transpose(1, 2).contiguous(), idx)
+    matched_out = matched_out.transpose(1, 2).contiguous()
+    dist2 = (pred - matched_out) ** 2
+    dist2 = dist2.view(dist2.shape[0], -1) # <-- ???
+    dist2 = torch.mean(dist2, dim=1, keepdims=True) # B,
+    dist2 /= pcd_radius
+    return torch.mean(dist2)
+
+def get_cd_loss(pred, gt, pcd_radius):
+    cost_for, cost_bac = chamfer_distance(gt, pred)
+    cost = 0.5 * cost_for + 0.5 * cost_bac
+    cost /= pcd_radius
+    cost = torch.mean(cost)
+    return cost
+
+
+def sample_task(TotalBatch, Batchsize, task_num):
+    # generate total task dataset
+    input_data = 2*torch.rand(TotalBatch, Batchsize, task_num, 2)
+    #gt_data = input_data
+    return input_data
+
+def nonuniform_sampling(num, sample_num):
+    sample = set()
+    loc = np.random.rand() * 0.8 + 0.1
+    while len(sample) < sample_num:
+        a = int(np.random.normal(loc=loc, scale=0.3) * num)  # loc: mean scale: std var
+        if a < 0 or a >= num:
+            continue
+        sample.add(a)
+    return list(sample)
+
+if __name__ == '__main__':
+    MODEL = importlib.import_module('models.' + args.model)
+    model = MODEL.get_model(npoint=1024, up_ratio=args.up_ratio, 
+                use_normal=False, use_bn=args.use_bn, use_res=args.use_res)
+
+    checkpoint = torch.load(args.resume)
+    model.load_state_dict(checkpoint['model_state'])
+    model.eval().cuda()
+
+    # eval_dst = PUNET_Dataset(h5_file_path='./datas/Patches_noHole_and_collected.h5', split='test', is_training=False)
+    # eval_loader = DataLoader(eval_dst, batch_size=args.batch_size, 
+    #                     shuffle=False, pin_memory=True, num_workers=args.workers)
+
+    eval_dataset = sample_task(2,1,4096)
+    emd_list = []
+    cd_list = []
+    with torch.no_grad():
+        #for itr, batch in enumerate(eval_loader):
+        for itr, batch in enumerate(eval_dataset):
+            #points, gt, radius = batch
+            points  = batch
+            gt = points
+            
+            torch.save(gt,'./gt%d.pt'%itr)
+            #print('input_data.shape', input_data.shape)
+            #centroid = torch.mean(gt_data[..., :2], axis=1, keepdims=True)
+            #furthest_distance,_ = torch.max(torch.sqrt(torch.sum((gt_data[..., :2] - centroid) ** 2, axis=-1)), axis=1, keepdims=True)
+            #radius_data = furthest_distance[:, 0].unsqueeze(1)
+            radius_data = torch.ones(len(points)).unsqueeze(1)
+            
+            sample_idx = nonuniform_sampling(points.shape[1], sample_num=1024)
+            points = points[:,sample_idx, :]           
+            torch.save(points,'./points%d.pt'%itr)
+            
+            
+            
+            #print('input_data.shape', input_data.shape)
+            # centroid = torch.mean(gt[..., :2], axis=1, keepdims=True)
+            # furthest_distance,_ = torch.max(torch.sqrt(torch.sum((gt[..., :2] - centroid) ** 2, axis=-1)), axis=1, keepdims=True)
+            # radius = furthest_distance[:, 0].unsqueeze(1)
+            
+            points = points[..., :2].float().cuda().contiguous()
+            gt = gt[..., :2].float().cuda().contiguous()
+            radius = radius_data.float().cuda()
+            preds = model(points, npoint=points.shape[1]) #points.shape[1])
+            print('preds', preds)
+            print('preds.shape', preds.shape)
+            torch.save(preds,'./preds%d.pt'%itr)
+
+            #emd = get_emd_loss(preds, gt, radius)
+            #cd = get_cd_loss(preds, gt, radius)
+            #print(' -- iter {}, emd {}, cd {}.'.format(itr, emd, cd))
+            #emd_list.append(emd.item())
+            #cd_list.append(cd.item())
+    
+    #print('mean emd: {}'.format(np.mean(emd_list)))
+    #print('mean cd: {}'.format(np.mean(cd_list)))
